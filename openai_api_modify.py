@@ -20,22 +20,27 @@ from sse_starlette.sse import EventSourceResponse
 from transformers import AutoTokenizer, AutoModelForCausalLM
 from transformers.generation import GenerationConfig
 
+from logging import getLogger, Formatter, INFO
+from db_connector import DatabaseLogHandler
+from db_pool_instance import db_pool
 
-def _gc(forced: bool = False):
-    global args
-    if args.disable_gc and not forced:
-        return
+# 设置日志配置
+logger = getLogger('chat_mgs_log')
+logger.setLevel(INFO)
+formatter = Formatter('%(asctime)s - %(name)s - %(levelname)s %(message)s')
+# 写日志到数据库中
 
-    import gc
-    gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+dblog = DatabaseLogHandler()
+dblog.setFormatter(formatter)
+logger.addHandler(dblog)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):  # collects GPU memory
     yield
-    _gc(forced=True)
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        torch.cuda.ipc_collect()
 
 
 app = FastAPI(lifespan=lifespan)
@@ -78,7 +83,11 @@ class DeltaMessage(BaseModel):
 
 class ChatCompletionRequest(BaseModel):
     model: str
+    user_id: str
     session_id: str
+    session_index: int
+    msg_index: int
+    chat_msg: str
     messages: List[ChatMessage]
     functions: Optional[List[Dict]] = None
     temperature: Optional[float] = None
@@ -109,10 +118,47 @@ class ChatCompletionResponse(BaseModel):
     created: Optional[int] = Field(default_factory=lambda: int(time.time()))
 
 
+class SentimentRequest(BaseModel):
+    user_id: str
+    session_id: str
+    msg_id: str
+    sentiment: int
+
+
+class SentimentResponse(BaseModel):
+    reply: str
+
+
+class ChatHistoryRequest(BaseModel):
+    user_id: str
+
+
+class ChatHistoryResponse(BaseModel):
+    user_id: str
+    session_ids: List = []
+    message_ids: List = [[]]
+    message_indexes: List = [[]]
+    messages: List = [[]]
+
+
+@app.get("/ping", response_model=str)
+async def ping():
+    return "pong"
+
+
+@app.get("/history/{user_id}", response_model=ChatHistoryResponse)
+async def get_history(user_id: str):
+    pool = db_pool
+    # user_id = request.user_id
+    session_ids, msg_ids, msg_indexes, chat_msgs = query_history(pool, user_id)
+    return ChatHistoryResponse(user_id=user_id, session_ids=session_ids,
+                               message_ids=msg_ids, message_indexes=msg_indexes, messages=chat_msgs)
+
+
 @app.get("/v1/models", response_model=ModelList)
 async def list_models():
     global model_args
-    model_card = ModelCard(id="gpt-3.5-turbo")
+    model_card = ModelCard(id="qwen-14b")
     return ModelList(data=[model_card])
 
 
@@ -127,6 +173,42 @@ def add_extra_stop_words(stop_words):
                 _stop_words.append(s)
         return _stop_words
     return stop_words
+
+
+def query_history(pool, user_id):
+    def fetch(sql):
+        conn = pool.connection()
+        cursor = conn.cursor()
+        cursor.execute(sql)
+        result = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        return result
+
+    sql = f"SELECT user_id , session_id FROM log WHERE user_id = '{user_id}' GROUP BY session_id"
+
+    result = fetch(sql)
+
+    session_ids = []
+    msg_ids = []
+    msg_indexes = []
+    chat_msgs = []
+    for row in result:
+        session_ids.append(row[1])
+        sql = f'''SELECT user_id, session_id, msg_id, msg_index, chat_msg FROM log WHERE user_id = '{row[0]}' AND session_id = '{row[1]}'
+        ORDER BY msg_id'''
+        ordered_result = fetch(sql)
+        msg_id = []
+        msg_index = []
+        chat_msg = []
+        for item in ordered_result:
+            msg_id.append(item[2])
+            msg_index.append(item[3])
+            chat_msg.append(item[4])
+        msg_ids.append(msg_id)
+        msg_indexes.append(msg_index)
+        chat_msgs.append(chat_msg)
+    return session_ids, msg_ids, msg_indexes, chat_msgs
 
 
 def trim_stop_words(response, stop_words):
@@ -359,6 +441,17 @@ def text_complete_last_message(history, stop_words_ids, gen_kwargs):
     return output
 
 
+@app.post("/v1/chat/sentiment", response_model=SentimentResponse)
+async def sentiment(request: SentimentRequest):
+    user_id = request.user_id
+    session_id = request.session_id
+    msg_id = request.msg_id
+    sentiment_id = request.sentiment_id
+    sentiment_msg = {"user_id": user_id, "session_id": session_id, "msg_id": msg_id, "sentiment_id": sentiment_id}
+    logger.info(sentiment_msg)
+    return SentimentResponse(reply="sentiment feedback received")
+
+
 @app.post("/v1/chat/completions", response_model=ChatCompletionResponse)
 async def create_chat_completion(request: ChatCompletionRequest):
     global model, tokenizer
@@ -387,7 +480,7 @@ async def create_chat_completion(request: ChatCompletionRequest):
                 status_code=400,
                 detail="Invalid request: Function calling is not yet implemented for stream mode.",
             )
-        generate = predict(query, history, request.model, stop_words, gen_kwargs)
+        generate = predict(query, history, request.model, stop_words, gen_kwargs, request)
         return EventSourceResponse(generate, media_type="text/event-stream")
 
     stop_words_ids = [tokenizer.encode(s) for s in stop_words] if stop_words else None
@@ -399,11 +492,10 @@ async def create_chat_completion(request: ChatCompletionRequest):
             query,
             history=history,
             stop_words_ids=stop_words_ids,
+            append_history=False,
             **gen_kwargs
         )
         print(f"<chat>\n{history}\n{query}\n<!-- *** -->\n{response}\n</chat>")
-    _gc()
-
     response = trim_stop_words(response, stop_words)
     if request.functions:
         choice_data = parse_response(response)
@@ -413,20 +505,25 @@ async def create_chat_completion(request: ChatCompletionRequest):
             message=ChatMessage(role="assistant", content=response),
             finish_reason="stop",
         )
+    user_id = request.user_id
+    session_id = request.session_id
+    msg_id = request.message_id
+    ask_role = request.messages[0].role
+    ask_content = request.messages[0].content
+    reply_role = choice_data.message.role
+    reply_content = choice_data.message.content
+    chat_msg = f"<{ask_role}>:{ask_content}\n <{reply_role}>:{reply_content}"
+    log_msg = {"user_id": user_id, "session_id": session_id, "msg_id": msg_id, "chat_msg": chat_msg}
+    logger.info(log_msg)
+
     return ChatCompletionResponse(
         model=request.model, choices=[choice_data], object="chat.completion"
     )
 
 
-def _dump_json(data: BaseModel, *args, **kwargs) -> str:
-    try:
-        return data.model_dump_json(*args, **kwargs)
-    except AttributeError:  # pydantic<2.0.0
-        return data.json(*args, **kwargs)  # noqa
-
-
 async def predict(
         query: str, history: List[List[str]], model_id: str, stop_words: List[str], gen_kwargs: Dict,
+        request: ChatCompletionRequest
 ):
     global model, tokenizer
     choice_data = ChatCompletionResponseStreamChoice(
@@ -435,7 +532,7 @@ async def predict(
     chunk = ChatCompletionResponse(
         model=model_id, choices=[choice_data], object="chat.completion.chunk"
     )
-    yield "{}".format(_dump_json(chunk, exclude_unset=True))
+    yield "{}".format(chunk.model_dump_json(exclude_unset=True))
 
     current_length = 0
     stop_words_ids = [tokenizer.encode(s) for s in stop_words] if stop_words else None
@@ -463,19 +560,32 @@ async def predict(
         chunk = ChatCompletionResponse(
             model=model_id, choices=[choice_data], object="chat.completion.chunk"
         )
-        yield "{}".format(_dump_json(chunk, exclude_unset=True))
+        yield "{}".format(chunk.model_dump_json(exclude_unset=True))
 
     print(f"full response: {msg}")
+    user_id = request.user_id
+    session_id = request.session_id
+    session_index = request.session_index
+    msg_index = request.message_index
+    msg_id = len(request.messages) - 1
+    ask_role = request.messages[-1].role
+    ask_content = request.messages[-1].content
+    reply_role = "assistant"
+    reply_content = msg
+    chat_msg = f"{ask_role}:{ask_content},{reply_role}:{reply_content}"
+    log_msg = {"user_id": user_id, "session_id": session_id, "msg_id": msg_id, "chat_msg": chat_msg,
+               "session_index": session_index, "msg_index": msg_index}
+    logger.info(log_msg)
+
+    print(f"stream all data {new_response}")
     choice_data = ChatCompletionResponseStreamChoice(
         index=0, delta=DeltaMessage(), finish_reason="stop"
     )
     chunk = ChatCompletionResponse(
         model=model_id, choices=[choice_data], object="chat.completion.chunk"
     )
-    yield "{}".format(_dump_json(chunk, exclude_unset=True))
+    yield "{}".format(chunk.model_dump_json(exclude_unset=True))
     yield "[DONE]"
-
-    _gc()
 
 
 def _get_args():
@@ -484,11 +594,11 @@ def _get_args():
         "-c",
         "--checkpoint-path",
         type=str,
-        default="Qwen/Qwen-7B-Chat",
+        default="QWen/QWen-7B-Chat",
         help="Checkpoint name or path, default to %(default)r",
     )
     parser.add_argument(
-        "--cpu-only", action="store_true", help="Run demo with CPU only"
+        "--cpu-only", action="store_true", default=False, help="Run demo with CPU only"
     )
     parser.add_argument(
         "--server-port", type=int, default=8000, help="Demo server port."
@@ -500,8 +610,6 @@ def _get_args():
         help="Demo server name. Default: 127.0.0.1, which is only visible from the local computer."
              " If you want other computers to access your server, use 0.0.0.0 instead.",
     )
-    parser.add_argument("--disable-gc", action="store_true",
-                        help="Disable GC after each response generated.")
 
     args = parser.parse_args()
     return args
@@ -510,28 +618,28 @@ def _get_args():
 if __name__ == "__main__":
     args = _get_args()
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.checkpoint_path,
-        trust_remote_code=True,
-        resume_download=True,
-    )
-
-    if args.cpu_only:
-        device_map = "cpu"
-    else:
-        device_map = "auto"
-
-    model = AutoModelForCausalLM.from_pretrained(
-        args.checkpoint_path,
-        device_map=device_map,
-        trust_remote_code=True,
-        resume_download=True,
-    ).eval()
-
-    model.generation_config = GenerationConfig.from_pretrained(
-        args.checkpoint_path,
-        trust_remote_code=True,
-        resume_download=True,
-    )
+    # tokenizer = AutoTokenizer.from_pretrained(
+    #     args.checkpoint_path,
+    #     trust_remote_code=True,
+    #     resume_download=True,
+    # )
+    #
+    # if args.cpu_only:
+    #     device_map = "cpu"
+    # else:
+    #     device_map = "auto"
+    #
+    # model = AutoModelForCausalLM.from_pretrained(
+    #     args.checkpoint_path,
+    #     device_map=device_map,
+    #     trust_remote_code=True,
+    #     resume_download=True,
+    # ).eval()
+    #
+    # model.generation_config = GenerationConfig.from_pretrained(
+    #     args.checkpoint_path,
+    #     trust_remote_code=True,
+    #     resume_download=True,
+    # )
 
     uvicorn.run(app, host=args.server_name, port=args.server_port, workers=1)
