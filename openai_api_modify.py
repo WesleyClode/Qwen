@@ -21,8 +21,8 @@ from transformers import AutoTokenizer, AutoModelForCausalLM
 from transformers.generation import GenerationConfig
 
 from logging import getLogger, Formatter, INFO
-from db_connector import DatabaseLogHandler
-from db_pool_instance import db_pool
+# from db_connector import DatabaseLogHandler
+# from db_pool_instance import db_pool
 
 # 设置日志配置
 logger = getLogger('chat_mgs_log')
@@ -30,9 +30,9 @@ logger.setLevel(INFO)
 formatter = Formatter('%(asctime)s - %(name)s - %(levelname)s %(message)s')
 # 写日志到数据库中
 
-dblog = DatabaseLogHandler()
-dblog.setFormatter(formatter)
-logger.addHandler(dblog)
+# dblog = DatabaseLogHandler()
+# dblog.setFormatter(formatter)
+# logger.addHandler(dblog)
 
 
 @asynccontextmanager
@@ -63,31 +63,27 @@ class ModelCard(BaseModel):
     parent: Optional[str] = None
     permission: Optional[list] = None
 
-
 class ModelList(BaseModel):
     object: str = "list"
     data: List[ModelCard] = []
 
-
 class ChatMessage(BaseModel):
-    id: str
+    messageId: Optional[str] = None
     role: Literal["user", "assistant", "system", "function"]
     content: Optional[str]
     function_call: Optional[Dict] = None
-
 
 class DeltaMessage(BaseModel):
     role: Optional[Literal["user", "assistant", "system"]] = None
     content: Optional[str] = None
 
-
 class ChatCompletionRequest(BaseModel):
-    model: str
+    model: Optional[str] = None
     user_id: str
     session_id: str
-    session_index: int
-    msg_index: int
-    chat_msg: str
+    # session_index: int
+    # msg_index: int
+    # chat_msg: str
     messages: List[ChatMessage]
     functions: Optional[List[Dict]] = None
     temperature: Optional[float] = None
@@ -96,12 +92,10 @@ class ChatCompletionRequest(BaseModel):
     stream: Optional[bool] = False
     stop: Optional[List[str]] = None
 
-
 class ChatCompletionResponseChoice(BaseModel):
     index: int
     message: ChatMessage
     finish_reason: Literal["stop", "length", "function_call"]
-
 
 class ChatCompletionResponseStreamChoice(BaseModel):
     index: int
@@ -110,7 +104,7 @@ class ChatCompletionResponseStreamChoice(BaseModel):
 
 
 class ChatCompletionResponse(BaseModel):
-    model: str
+    model: Optional[str] = None
     object: Literal["chat.completion", "chat.completion.chunk"]
     choices: List[
         Union[ChatCompletionResponseChoice, ChatCompletionResponseStreamChoice]
@@ -146,13 +140,13 @@ async def ping():
     return "pong"
 
 
-@app.get("/history/{user_id}", response_model=ChatHistoryResponse)
-async def get_history(user_id: str):
-    pool = db_pool
-    # user_id = request.user_id
-    session_ids, msg_ids, msg_indexes, chat_msgs = query_history(pool, user_id)
-    return ChatHistoryResponse(user_id=user_id, session_ids=session_ids,
-                               message_ids=msg_ids, message_indexes=msg_indexes, messages=chat_msgs)
+# @app.get("/history/{user_id}", response_model=ChatHistoryResponse)
+# async def get_history(user_id: str):
+#     pool = db_pool
+#     # user_id = request.user_id
+#     session_ids, msg_ids, msg_indexes, chat_msgs = query_history(pool, user_id)
+#     return ChatHistoryResponse(user_id=user_id, session_ids=session_ids,
+#                                message_ids=msg_ids, message_indexes=msg_indexes, messages=chat_msgs)
 
 
 @app.get("/v1/models", response_model=ModelList)
@@ -456,69 +450,84 @@ async def sentiment(request: SentimentRequest):
 async def create_chat_completion(request: ChatCompletionRequest):
     global model, tokenizer
 
-    gen_kwargs = {}
-    if request.temperature is not None:
-        if request.temperature < 0.01:
-            gen_kwargs['top_k'] = 1  # greedy decoding
-        else:
-            # Not recommended. Please tune top_p instead.
-            gen_kwargs['temperature'] = request.temperature
-    if request.top_p is not None:
-        gen_kwargs['top_p'] = request.top_p
+    # gen_kwargs = {}
+    # if request.temperature is not None:
+    #     if request.temperature < 0.01:
+    #         gen_kwargs['top_k'] = 1  # greedy decoding
+    #     else:
+    #         # Not recommended. Please tune top_p instead.
+    #         gen_kwargs['temperature'] = request.temperature
+    # if request.top_p is not None:
+    #     gen_kwargs['top_p'] = request.top_p
 
-    stop_words = add_extra_stop_words(request.stop)
-    if request.functions:
-        stop_words = stop_words or []
-        if "Observation:" not in stop_words:
-            stop_words.append("Observation:")
+    # stop_words = add_extra_stop_words(request.stop)
+    # if request.functions:
+    #     stop_words = stop_words or []
+    #     if "Observation:" not in stop_words:
+    #         stop_words.append("Observation:")
 
-    query, history = parse_messages(request.messages, request.functions)
+    # query, history = parse_messages(request.messages, request.functions)
 
-    if request.stream:
-        if request.functions:
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid request: Function calling is not yet implemented for stream mode.",
-            )
-        generate = predict(query, history, request.model, stop_words, gen_kwargs, request)
-        return EventSourceResponse(generate, media_type="text/event-stream")
+    # if request.stream:
+    #     if request.functions:
+    #         raise HTTPException(
+    #             status_code=400,
+    #             detail="Invalid request: Function calling is not yet implemented for stream mode.",
+    #         )
+    #     generate = predict(query, history, request.model, stop_words, gen_kwargs, request)
+    #     return EventSourceResponse(generate, media_type="text/event-stream")
 
-    stop_words_ids = [tokenizer.encode(s) for s in stop_words] if stop_words else None
-    if query is _TEXT_COMPLETION_CMD:
-        response = text_complete_last_message(history, stop_words_ids=stop_words_ids, gen_kwargs=gen_kwargs)
-    else:
-        response, _ = model.chat(
-            tokenizer,
-            query,
-            history=history,
-            stop_words_ids=stop_words_ids,
-            append_history=False,
-            **gen_kwargs
+    # stop_words_ids = [tokenizer.encode(s) for s in stop_words] if stop_words else None
+    # if query is _TEXT_COMPLETION_CMD:
+    #     response = text_complete_last_message(history, stop_words_ids=stop_words_ids, gen_kwargs=gen_kwargs)
+    # else:
+    #     response, _ = model.chat(
+    #         tokenizer,
+    #         query,
+    #         history=history,
+    #         stop_words_ids=stop_words_ids,
+    #         append_history=False,
+    #         **gen_kwargs
+    #     )
+    #     print(f"<chat>\n{history}\n{query}\n<!-- *** -->\n{response}\n</chat>")
+    # response = trim_stop_words(response, stop_words)
+    response="123fdsaf"
+    async def generate_response(response):
+        choice_data = ChatCompletionResponseStreamChoice(
+            index=0, delta=DeltaMessage(content=response), finish_reason=None
         )
-        print(f"<chat>\n{history}\n{query}\n<!-- *** -->\n{response}\n</chat>")
-    response = trim_stop_words(response, stop_words)
-    if request.functions:
-        choice_data = parse_response(response)
-    else:
-        choice_data = ChatCompletionResponseChoice(
-            index=0,
-            message=ChatMessage(role="assistant", content=response),
-            finish_reason="stop",
+        chunk = ChatCompletionResponse(
+            choices=[choice_data], object="chat.completion.chunk"
         )
-    user_id = request.user_id
-    session_id = request.session_id
-    msg_id = request.message_id
-    ask_role = request.messages[0].role
-    ask_content = request.messages[0].content
-    reply_role = choice_data.message.role
-    reply_content = choice_data.message.content
-    chat_msg = f"<{ask_role}>:{ask_content}\n <{reply_role}>:{reply_content}"
-    log_msg = {"user_id": user_id, "session_id": session_id, "msg_id": msg_id, "chat_msg": chat_msg}
-    logger.info(log_msg)
+        yield "{}".format(chunk.model_dump_json(exclude_unset=True))
 
-    return ChatCompletionResponse(
-        model=request.model, choices=[choice_data], object="chat.completion"
-    )
+        choice_data = ChatCompletionResponseStreamChoice(
+            index=0, delta=DeltaMessage(), finish_reason="stop"
+        )
+        chunk = ChatCompletionResponse(
+            choices=[choice_data], object="chat.completion.chunk"
+        )
+        yield "{}".format(chunk.model_dump_json(exclude_unset=True))
+        # yield "[DONE]"
+
+    res=generate_response(response)
+    return EventSourceResponse(res, media_type="text/event-stream")
+
+    # if request.functions:
+    #     choice_data = parse_response(response)
+    # else:
+    #     choice_data = ChatCompletionResponseChoice(
+    #         index=0,
+    #         message=ChatMessage(role="assistant", content=response, messageId="123"),
+    #         finish_reason="stop",
+    #     )
+    # print("ChatCompletionResponse choice_data1:", choice_data)
+    # choice_data1 = ChatCompletionResponse(
+    #     model=request.model, choices=[choice_data], object="chat.completion"
+    # )
+    # print("ChatCompletionResponse choice_data2:", choice_data1)
+
+    # return choice_data1
 
 
 async def predict(
